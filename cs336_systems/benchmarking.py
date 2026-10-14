@@ -71,7 +71,7 @@ def measure_training_loop(model: torch.nn.Module, warmup_count: int, iteration_c
 
         del data, labels, guessed_labels
 
-    return total_time
+    return total_time / iteration_count
 
 OPERATION_MODES = {
     "forward": 0,
@@ -94,7 +94,7 @@ def get_args():
     return parser.parse_args()
 
 def main():
-    device = torch.device("cude" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device is {device}")
 
     args = get_args()
@@ -111,7 +111,7 @@ def main():
 
     operation_mode = OPERATION_MODES[args.operation_mode]
     total_time = measure_training_loop(transformer, args.warmup_count, args.iteration_count, operation_mode, args.vocab_size, args.batch_size, args.context_length, device)
-    print(f"Took total time of {total_time}")
+    print(f"Average iteration time {total_time}")
 
 if __name__ == "__main__":
     main()
