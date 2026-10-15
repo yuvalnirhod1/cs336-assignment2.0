@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange, einsum, reduce, repeat
+import torch.cuda.nvtx as nvtx
+from torch.utils.checkpoint import checkpoint
 
 def normal_init(t: torch.Tensor, sigma_squred=1):
     sigma = np.sqrt(sigma_squred)
@@ -115,13 +117,17 @@ def dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mas
     d_k = k.shape[-1]
     d_v = v.shape[-1]
 
-    query_keys = einsum(q, k, "... query_seq_len key_dim, ... key_seq_len key_dim -> ... query_seq_len key_seq_len") / np.sqrt(d_k)
+    with nvtx.range("Attention matrix multiplication"):
+        query_keys = einsum(q, k, "... query_seq_len key_dim, ... key_seq_len key_dim -> ... query_seq_len key_seq_len") / np.sqrt(d_k)
 
     if mask is not None:
         query_keys = query_keys + torch.where(mask, 0.0, -torch.inf).to(query_keys.device)
 
-    matches = softmax(query_keys, -1)
-    return einsum(matches, v, "... query_seq_len target_seq_len, ... target_seq_len value_dim -> ... query_seq_len value_dim")
+    with nvtx.range("Softmax"):
+        matches = softmax(query_keys, -1)
+
+    with nvtx.range("Attention matrix multiplication"):
+        return einsum(matches, v, "... query_seq_len target_seq_len, ... target_seq_len value_dim -> ... query_seq_len value_dim")
 
 class MultiHeadSelfAttention(torch.nn.Module):
     def __init__(self, d_model: int, num_heads: int, theta = None, max_seq_len = None, d_keys: int = None, d_values: int = None, device=None, dtype=None):
@@ -173,10 +179,15 @@ class TransformerBlock(torch.nn.Module):
 
 class TransformerLM(torch.nn.Module):
     def __init__(self, d_model: int, num_heads: int, vocab_size: int, context_length: int, num_layers: int,
-                 d_ff: int = None, theta=None, device=None, dtype=None):
+                 d_ff: int = None, theta=None, device=None, dtype=None, checkpoints: int = None):
         super().__init__()
+
+        assert checkpoints is None or num_layers % checkpoints == 0, "Checkpoints must divide layers"
+        self.checkpoints = checkpoints
+        self.num_layers = num_layers
         attentions = [TransformerBlock(d_model, num_heads, d_ff=d_ff, theta=theta, max_seq_len=context_length,
                                                   device=device, dtype=dtype) for _ in range(num_layers)]
+
         self.attentions = torch.nn.Sequential(*attentions)
 
         self.embeddings = Embeddings(vocab_size, d_model, device=device, dtype=dtype)
@@ -185,7 +196,22 @@ class TransformerLM(torch.nn.Module):
         self.w_final = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor):
-        return self.w_final(self.norm_final(self.attentions(self.embeddings(x))))
+        x = self.embeddings(x)
+        
+        if self.checkpoints is None:
+            x = self.attentions(x)
+        else:
+            def call_indexed_attention_layers(i, j, attentions):
+                def call_indexed_attention_layers_inner(x):
+                    for index in range(i, j):
+                        x = attentions[index](x) 
+                    return x
+                return call_indexed_attention_layers_inner
+            div = self.num_layers // self.checkpoints
+            for index in range(self.checkpoints):
+                x = checkpoint(call_indexed_attention_layers(index * div, (index + 1) * div, self.attentions), x)
+            
+        return self.w_final(self.norm_final(x))
 
 def main():
     hidden_dims = 64 

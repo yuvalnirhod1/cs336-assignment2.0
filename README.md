@@ -63,3 +63,10 @@ To submit, run `./test_and_make_submission.sh` . This script will install your
 code's dependencies, run tests, and create a gzipped tarball with the output. We
 should be able to unzip your submitted tarball and run
 `./test_and_make_submission.sh` to verify your test results.
+
+
+# My answers to some of the questions - 
+## Gradient checkpointing
+(a) The best memory activation strategy would be to calculate the current activation layer, each time, from the start. It will lead to O(1) memory usage, but O(1 + 2 + 3 ... + n = n ** 2) computation complexity.
+
+(b) The peak strategy is using O(sqrt(N))
