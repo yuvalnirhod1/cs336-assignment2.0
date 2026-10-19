@@ -3,8 +3,8 @@ import triton
 import numpy as np
 import triton.language as tl
 
-QUERY_TILE_SIZE = 32
-KEY_TILE_SIZE = 16
+QUERY_TILE_SIZE = 16
+KEY_TILE_SIZE = 32 
 
 class FlashAttention(torch.autograd.Function):
     @staticmethod
@@ -46,7 +46,8 @@ class FlashAttention(torch.autograd.Function):
             # ctx.KEY_TILE_SIZE
             D,
             QUERY_TILE_SIZE,
-            KEY_TILE_SIZE
+            KEY_TILE_SIZE,
+            is_casual
         )
 
         
@@ -137,6 +138,15 @@ def flash_fwd_kernel(
 
 
         attention_scores = tl.dot(Q, K.T) / scale # Bq X Bk 16 x 32
+
+        if is_casual:
+            query_index = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            key_index = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = query_index[:, None] < key_index[None, :]
+            mask *= -1e6
+            # tl.device_print("Mat", mask)
+            attention_scores += mask
+
         new_max = tl.maximum(max, tl.max(attention_scores, axis=1)) # Bq 16
 
         # probabilities = tl.exp(attention_scores - new_max[:, None]) # Bq X Bk
@@ -171,7 +181,7 @@ def main():
     Q = Q.to(device)
     K = K.to(device)
     V = V.to(device)
-    output = FlashAttention.forward(FlashAttention, Q, K, V)
+    output = FlashAttention.forward(FlashAttention, Q, K, V, True)
     print(output)
 
 if __name__ == "__main__":
