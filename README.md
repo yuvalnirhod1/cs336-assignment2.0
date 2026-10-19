@@ -70,3 +70,7 @@ should be able to unzip your submitted tarball and run
 (a) The best memory activation strategy would be to calculate the current activation layer, each time, from the start. It will lead to O(1) memory usage, but O(1 + 2 + 3 ... + n = n ** 2) computation complexity.
 
 (b) The peak strategy is using O(sqrt(N))
+
+## torch_compile
+(2) Compiling the transformer module makes it about ten times faster!
+
