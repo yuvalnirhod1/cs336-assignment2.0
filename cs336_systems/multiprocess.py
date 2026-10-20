@@ -11,19 +11,26 @@ class DDP(torch.nn.Module):
     def __init__(self, module: torch.nn.Module, src_rank=0):
         super().__init__()
         self.module = module
+        self.handles = []
 
         with torch.no_grad():
             for param in self.module.parameters():
                 dist.broadcast(param, src=src_rank)
+                if param.requires_grad:
+                    param.register_post_accumulate_grad_hook(self.send_grad)
+            
+    def send_grad(self, param):
+        with torch.no_grad():
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
+            self.handles.append(handle)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.module(x)
+    def forward(self, *inputs, **kwargs) -> torch.Tensor:
+        return self.module(*inputs, **kwargs)
     
     def finish_gradient_synchronization(self):
-        with torch.no_grad():
-            for param in self.module.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=False)
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"

@@ -58,7 +58,6 @@ Type "help", "copyright", "credits" or "license" for more information.
 `uv run` installs dependencies automatically as dictated in the `pyproject.toml` file.
 
 ## Submitting
-
 To submit, run `./test_and_make_submission.sh` . This script will install your
 code's dependencies, run tests, and create a gzipped tarball with the output. We
 should be able to unzip your submitted tarball and run
@@ -74,3 +73,8 @@ should be able to unzip your submitted tarball and run
 ## torch_compile
 (2) Compiling the transformer module makes it about ten times faster!
 
+
+## DDP measurements
+1. Naive DDP - 32.07
+2. Concatinate tensor - 32.63 (Made is worst)
+3. Async grads - 28.62
