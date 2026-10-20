@@ -17,6 +17,11 @@ import torch.distributed as dist
 from .multiprocess import DDP
 import os
 
+def _cleanup_process_group():
+    # Synchronize before we destroy the process group
+    dist.barrier()
+    dist.destroy_process_group()
+
 def _setup_process_group(rank, world_size, backend):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12390"
@@ -94,10 +99,10 @@ OPERATION_MODES = {
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iteration_count", type=int, default=10)
+    parser.add_argument("--iteration_count", type=int, default=50)
     parser.add_argument("--vocab_size", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--context_length", type=int, default=128)
+    parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--num_layers", type=int, default=12)
@@ -150,6 +155,7 @@ def distributed_training(rank, world_size, args):
     )
 
     measure_training_loop(DDP(transformer), args.iteration_count, args.vocab_size, args.batch_size, args.context_length, device, rank, world_size)
+    _cleanup_process_group()
 
 
 if __name__ == "__main__":
