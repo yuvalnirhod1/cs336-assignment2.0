@@ -76,5 +76,6 @@ should be able to unzip your submitted tarball and run
 
 ## DDP measurements
 1. Naive DDP - 32.07
-2. Concatinate tensor - 32.63 (Made is worst)
+2. Concatinate tensor - 32.63 (Made it worst)
 3. Async grads - 28.62
+4. Gradient shrading - 27.43
