@@ -24,9 +24,9 @@ class ToyFSDPModel(nn.Module):
 
     def __init__(self, vocab_size=100, d_model=64, d_ff=128):
         super().__init__()
-        from cs336_basics.model import Embedding, Linear, RMSNorm
+        from cs336_basics.transformer import Embeddings, Linear, RMSNorm
 
-        self.embedding = Embedding(vocab_size, d_model)
+        self.embedding = Embeddings(vocab_size, d_model)
         self.norm1 = RMSNorm(d_model)
         self.linear1 = Linear(d_model, d_ff)
         self.norm2 = RMSNorm(d_ff)
@@ -50,10 +50,10 @@ def _apply_mixed_precision_hooks(model, compute_dtype):
     behavior: cast Linear/Embedding weights to compute_dtype for
     forward/backward, keep master weights and optimizer updates in fp32.
     """
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.transformer import Embeddings, Linear
 
     for mod in model.modules():
-        if not isinstance(mod, (Linear, Embedding)):
+        if not isinstance(mod, (Linear, Embeddings)):
             continue
 
         # Forward: cast weight to compute_dtype, restore fp32 after
@@ -201,7 +201,7 @@ def test_fsdp_gradient_sync(compute_dtype):
 
 
 def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.transformer import Embeddings, Linear
 
     torch.use_deterministic_algorithms(True)
     device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
@@ -237,7 +237,7 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
             continue
         parts = name.rsplit(".", 1)
         mod = dict(fsdp_model.module.named_modules())[parts[0]] if len(parts) == 2 else fsdp_model.module
-        if isinstance(mod, (Linear, Embedding)):
+        if isinstance(mod, (Linear, Embeddings)):
             continue
         gathered = [torch.zeros_like(param.grad) for _ in range(world_size)]
         dist.all_gather(gathered, param.grad)

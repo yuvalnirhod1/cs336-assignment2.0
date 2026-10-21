@@ -14,7 +14,7 @@ import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from .multiprocess import DDP
+from .multiprocess import DDP, FSDP, ShardedOptimizer
 import os
 
 def _cleanup_process_group():
@@ -47,9 +47,9 @@ def measure_training_loop(model: torch.nn.Module, iteration_count: int, vocab_si
     training_config = DEFAULT_CONFIG["training"]
     ### Configure optimizer
     lr = optimizer_config["lr"] # 
-    optimizer = AdamW(model.parameters(),
-                        lr,
-                        optimizer_config["weight_decay"],
+    optimizer = ShardedOptimizer(model.parameters(), AdamW,
+                        lr=lr,
+                        weight_decay=optimizer_config["weight_decay"],
                         betas=optimizer_config["betas"],
                         eps=optimizer_config["eps"])
 
@@ -154,7 +154,7 @@ def distributed_training(rank, world_size, args):
         checkpoints=args.checkpoints
     )
 
-    measure_training_loop(DDP(transformer), args.iteration_count, args.vocab_size, args.batch_size, args.context_length, device, rank, world_size)
+    measure_training_loop(FSDP(transformer), args.iteration_count, args.vocab_size, args.batch_size, args.context_length, device, rank, world_size)
     _cleanup_process_group()
 
 

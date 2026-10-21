@@ -5,6 +5,41 @@ import torch.multiprocessing as mp
 import sys
 import timeit
 from typing import Type, Any, Dict
+from cs336_basics.transformer import Embeddings, Linear
+
+class FSDP(torch.nn.Module):
+    
+    def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
+        super().__init__()
+
+        for name, parameter in module.state_dict():
+            module.state_dict
+        for parameter in module.parameters():
+            if isintance(parameter, Embeddings) or isintance(parameter, Linear):
+                parameters.append(self.slice_parameter(parameter))
+                del parameter
+            else:
+                parameters.append(parameter)
+            
+        self.layers = torch.nn.Sequential(*parameters)
+
+    def construct_forward_hook(self, layer_index: int):
+        def forward_hook(module: torch.nn.Module, inputs, output):
+            pass
+
+        return forward_hook
+
+    def construct_backward_hook(self, layer_index: int):
+        def backward_hook(module: torch.nn.Module, grad_inputs, grad_output):
+            pass
+
+        return backward_hook
+
+    def forward(self, *inputs, **kwargs) -> torch.Tensor:
+        return self.module(*inputs, **kwargs)
+    
+    def finish_gradient_synchronization(self):
+        pass
 
 class ShardedOptimizer(torch.optim.Optimizer):
 
@@ -15,10 +50,12 @@ class ShardedOptimizer(torch.optim.Optimizer):
         params = list(params)
 
         optimizer_params = self.slice_list_of_params(params)
-        # print(params, optimizer_params)
 
         self.optimizer = optimizer_cls(optimizer_params, **kwargs)
         super().__init__(params, {})
+    
+    def update_lr(self, lr):
+        self.optimizer.update_lr(lr)
 
     def slice_param(self, param):
         with torch.no_grad():
