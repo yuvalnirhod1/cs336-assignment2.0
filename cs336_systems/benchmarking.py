@@ -53,6 +53,12 @@ def measure_training_loop(model: torch.nn.Module, iteration_count: int, vocab_si
                         betas=optimizer_config["betas"],
                         eps=optimizer_config["eps"])
 
+    # optimizer = AdamW(model.parameters(),
+    #                     lr=lr,
+    #                     weight_decay=optimizer_config["weight_decay"],
+    #                     betas=optimizer_config["betas"],
+    #                     eps=optimizer_config["eps"])
+
     ### Training loop
     total_time = 0
 

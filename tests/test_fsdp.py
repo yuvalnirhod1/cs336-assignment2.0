@@ -171,7 +171,7 @@ def _test_fsdp_correctness(rank: int, world_size: int, compute_dtype):
             fsdp_full = full_params[name]
             if compute_dtype is None:
                 assert torch.allclose(np_param.data, fsdp_full, atol=1e-6, rtol=1e-4), (
-                    f"Step {step}: Parameter {name} mismatch. Max diff: {(np_param.data - fsdp_full).abs().max().item()}"
+                    f"Step {step}: Parameter {name} mismatch. Max diff: {np_param.data} {fsdp_full}"
                 )
             else:
                 assert torch.allclose(np_param.data, fsdp_full, atol=1e-4, rtol=1e-4), (

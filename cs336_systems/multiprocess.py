@@ -6,40 +6,142 @@ import sys
 import timeit
 from typing import Type, Any, Dict
 from cs336_basics.transformer import Embeddings, Linear
+import copy
+
+def alloc_storage(tensor: torch.Tensor, size: int):
+    storage = tensor.untyped_storage()
+    if storage.size() != size:
+        storage.resize_(size)
+
+def free_storage(tensor: torch.Tensor):
+    alloc_storage(tensor, 0)
+
+def revive_storage(tensor: torch.Tensor):
+    alloc_storage(tensor, tensor.nbytes)
+
+def master_print(*args, **kwargs):
+    if dist.get_rank() == 0:
+        print(*args, **kwargs)
 
 class FSDP(torch.nn.Module):
+
+    SHARD_TYPES = (Embeddings, Linear)
     
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
         super().__init__()
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
+        self.compute_dtype = compute_dtype
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
 
-        for name, parameter in module.state_dict():
-            module.state_dict
-        for parameter in module.parameters():
-            if isintance(parameter, Embeddings) or isintance(parameter, Linear):
-                parameters.append(self.slice_parameter(parameter))
-                del parameter
-            else:
-                parameters.append(parameter)
+        saved_parameters = torch.nn.ParameterDict()
+        for name, sub_module in module.named_modules():
+            if isinstance(sub_module, self.SHARD_TYPES):
+                saved_parameters[name] = self.split_module(sub_module)
+
+                sub_module.register_forward_pre_hook(self.construct_pre_forward_hook(name))
+                sub_module.register_forward_hook(self.construct_post_forward_hook(name))
+                sub_module.register_full_backward_pre_hook(self.construct_pre_backward_hook(name))
+                sub_module.register_full_backward_hook(self.construct_post_backward_hook(name))
+        
+        self.saved_parameters = saved_parameters
+        self.module = module
+    
+    def named_parameters(self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True,):
+        seen_parameters = set()
+        total_index = 0
+        for name, module in self.saved_parameters.items():
+            for parameter in module.values():
+                if parameter is None:
+                    continue
+                if remove_duplicate:
+                    if parameter in seen_parameters:
+                        continue
+                    seen_parameters.add(parameter)
+                
+                name = f"{prefix}.{total_index}" if prefix else total_index
+                total_index += 1
+                yield name, parameter
+
+    def parameters(self, recurse: bool = True):
+        for _, param in self.named_parameters(recurse=recurse):
+            yield param
             
-        self.layers = torch.nn.Sequential(*parameters)
+    def slice_tensor(self, tensor):
+        return torch.nn.Parameter(tensor.view(-1).chunk(self.world_size)[self.rank].clone())
+        
+    @torch.no_grad()
+    def split_module(self, module):
+        sliced_parameters = {}
+        for name, parameter in module.named_parameters():
+            sliced_parameters[name] = self.slice_tensor(parameter)
+        self.free_module(module)
+        return sliced_parameters
 
-    def construct_forward_hook(self, layer_index: int):
-        def forward_hook(module: torch.nn.Module, inputs, output):
-            pass
+    @torch.no_grad() 
+    def all_gather_module(self, module, module_name):
+        for name, parameter in module.named_parameters():
+            revive_storage(parameter)
+            if parameter.grad is not None:
+                revive_storage(parameter.grad)
+            shraded_parameter = self.saved_parameters[module_name][name]
+            dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data)
 
+    @torch.no_grad()
+    def free_module(self, module):
+        for parameter in module.parameters():
+            if parameter.grad is not None:
+                free_storage(parameter.grad)
+            free_storage(parameter) 
+    
+    def construct_pre_forward_hook(self, layer_name: int):
+        def forward_hook(module: torch.nn.Module, inputs):
+            self.all_gather_module(module, layer_name)
         return forward_hook
 
-    def construct_backward_hook(self, layer_index: int):
-        def backward_hook(module: torch.nn.Module, grad_inputs, grad_output):
-            pass
+    def construct_post_forward_hook(self, layer_name: int):
+        def forward_hook(module: torch.nn.Module, inputs, output):
+            self.free_module(module)
+        return forward_hook
 
+    def construct_pre_backward_hook(self, layer_name: int):
+        def backward_hook(module: torch.nn.Module, grad_inputs):
+            self.all_gather_module(module, layer_name)
+        return backward_hook
+
+    def construct_post_backward_hook(self, layer_name: int):
+        def backward_hook(module: torch.nn.Module, grad_inputs, grad_output):
+            with torch.no_grad():
+                for name, parameter in module.named_parameters():
+                    if name in self.saved_parameters[layer_name]:
+                        if parameter.grad is not None:
+                            sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
+                            dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG)
+                            if sliced_gradient is not None:
+                                master_print(sliced_gradient)
+                            self.saved_parameters[layer_name][name].grad = sliced_gradient
+                        self.free_module(module)
         return backward_hook
 
     def forward(self, *inputs, **kwargs) -> torch.Tensor:
         return self.module(*inputs, **kwargs)
     
     def finish_gradient_synchronization(self):
-        pass
+        dist.barrier()
+    
+    def gather_full_params(self):
+
+        for submodule_name, sub_module in self.module.named_modules():
+            if isinstance(sub_module, self.SHARD_TYPES):
+                self.all_gather_module(sub_module, submodule_name)
+            
+        new_state_dict = copy.deepcopy(self.module.state_dict())
+
+        for submodule_name, sub_module in self.module.named_modules():
+            if isinstance(sub_module, self.SHARD_TYPES):
+                self.free_module(sub_module)
+        
+        return new_state_dict
 
 class ShardedOptimizer(torch.optim.Optimizer):
 
