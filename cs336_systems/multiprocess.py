@@ -43,11 +43,11 @@ class FSDP(torch.nn.Module):
         self.rank = dist.get_rank()
         self.end_handles = []
 
-        self.sharded_handles = {}
-        self.current_index = 0
-
         self.backward_sharded_handles = {}
         self.backward_current_index = 30
+
+        self.lookahead_count = 0
+        self.index_to_layer = {}
 
         saved_parameters = torch.nn.ParameterDict()
         for name, sub_module in module.named_modules():
@@ -55,12 +55,14 @@ class FSDP(torch.nn.Module):
                 saved_parameters[name] = self.split_module(sub_module)
 
                 sub_module.register_forward_pre_hook(self.construct_pre_forward_hook(name))
-                sub_module.register_forward_hook(self.construct_post_forward_hook(name))
+                sub_module.register_forward_hook(self.construct_post_forward_hook(name, True))
                 sub_module.register_full_backward_pre_hook(self.construct_pre_backward_hook(name))
 
                 for param_name, parameter in sub_module.named_parameters():
                     parameter.register_post_accumulate_grad_hook(self.construct_post_backward_hook(name, param_name))
             else:
+                sub_module.register_forward_hook(self.construct_post_forward_hook(name, False))
+
                 for param_name, parameter in sub_module.named_parameters():
                     if parameter.requires_grad:
                         parameter.register_post_accumulate_grad_hook(self.send_grad)
@@ -110,16 +112,28 @@ class FSDP(torch.nn.Module):
     def construct_pre_forward_hook(self, layer_name: str):
         def forward_hook(module: torch.nn.Module, inputs):
             # Should happen before
-            self.sharded_handles[self.current_index + LOOKAHEAD_COUNT] = self.all_gather_module(module, layer_name)
+            if self.lookahead_count == 0:
+                self.sharded_handles[self.current_index] = self.all_gather_module(module, layer_name)
 
             # Should happen now
             self.sharded_handles[self.current_index].wait()
-            self.current_index += 1
         return forward_hook
 
-    def construct_post_forward_hook(self, layer_name: str):
+    def construct_post_forward_hook(self, layer_name: str, should_free: bool):
         def forward_hook(module: torch.nn.Module, inputs, output):
-            self.free_module(module)
+            if should_free:
+                self.free_module(module)
+
+            if self.lookahead_count == 0:
+                self.index_to_layer[self.current_index] = (module, layer_name)
+            else:
+                if self.current_index + self.lookahead_count <= self.max_index:
+                    lookahead_layer, lookahead_layer_name = self.index_to_layer[self.current_index + self.lookahead_count]
+                    if lookahead_layer_name in self.saved_parameters:
+                        self.sharded_handles[self.current_index + self.lookahead_count] = self.all_gather_module(lookahead_layer, lookahead_layer_name)
+
+            self.current_index += 1
+            
         return forward_hook
 
     def construct_pre_backward_hook(self, layer_name: str):
@@ -177,7 +191,22 @@ class FSDP(torch.nn.Module):
     def forward(self, *inputs, **kwargs) -> torch.Tensor:
         self.current_index = 0
         self.sharded_handles = {}
-        return self.module(*inputs, **kwargs)
+
+        if self.lookahead_count > 0:
+            for i in range(self.lookahead_count):
+                lookahead_layer, lookahead_layer_name = self.index_to_layer[i]
+                if lookahead_layer_name in self.saved_parameters:
+                    self.sharded_handles[i] = self.all_gather_module(lookahead_layer, lookahead_layer_name)
+
+        output = self.module(*inputs, **kwargs)
+
+        if self.lookahead_count == 0:
+            self.max_index = self.current_index - 1
+            self.backward_current_index = self.max_index
+            
+            self.lookahead_count = 2
+        
+        return output
     
     def finish_gradient_synchronization(self):
         for handle in self.end_handles:
