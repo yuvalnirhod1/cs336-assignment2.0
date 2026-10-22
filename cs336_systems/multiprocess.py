@@ -23,7 +23,15 @@ def master_print(*args, **kwargs):
     if dist.get_rank() == 0:
         print(*args, **kwargs)
 
+LOOKAHEAD_COUNT = 0
+
 class FSDP(torch.nn.Module):
+    # TODO:
+    # 1. Add compute_dtype usage
+    # 2. Add order figuring out
+    # 3. Add sending trigger 2 layers in advance
+    # 4. Add hooks for async gradient send in post_grad hook that free the parameter,
+    #    and wait for them at synchronize
 
     SHARD_TYPES = (Embeddings, Linear)
     
@@ -33,6 +41,13 @@ class FSDP(torch.nn.Module):
         self.compute_dtype = compute_dtype
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
+        self.end_handles = []
+
+        self.sharded_handles = {}
+        self.current_index = 0
+
+        self.backward_sharded_handles = {}
+        self.backward_current_index = 30
 
         saved_parameters = torch.nn.ParameterDict()
         for name, sub_module in module.named_modules():
@@ -42,26 +57,25 @@ class FSDP(torch.nn.Module):
                 sub_module.register_forward_pre_hook(self.construct_pre_forward_hook(name))
                 sub_module.register_forward_hook(self.construct_post_forward_hook(name))
                 sub_module.register_full_backward_pre_hook(self.construct_pre_backward_hook(name))
-                sub_module.register_full_backward_hook(self.construct_post_backward_hook(name))
+
+                for param_name, parameter in sub_module.named_parameters():
+                    parameter.register_post_accumulate_grad_hook(self.construct_post_backward_hook(name, param_name))
+            else:
+                for param_name, parameter in sub_module.named_parameters():
+                    if parameter.requires_grad:
+                        parameter.register_post_accumulate_grad_hook(self.send_grad)
         
         self.saved_parameters = saved_parameters
         self.module = module
     
     def named_parameters(self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True,):
-        seen_parameters = set()
-        total_index = 0
-        for name, module in self.saved_parameters.items():
-            for parameter in module.values():
-                if parameter is None:
-                    continue
-                if remove_duplicate:
-                    if parameter in seen_parameters:
-                        continue
-                    seen_parameters.add(parameter)
-                
-                name = f"{prefix}.{total_index}" if prefix else total_index
-                total_index += 1
-                yield name, parameter
+        for name, parameter in self.module.named_parameters(prefix=prefix, recurse=recurse, remove_duplicate=remove_duplicate):
+            chosen_parameter = parameter
+            for module_name, parameters in self.saved_parameters.items():
+                for shraded_parameter_name, shraded_parameter in parameters.items():
+                    if f"{module_name}.{shraded_parameter_name}" == name:
+                        chosen_parameter = shraded_parameter
+            yield name, chosen_parameter 
 
     def parameters(self, recurse: bool = True):
         for _, param in self.named_parameters(recurse=recurse):
@@ -85,50 +99,62 @@ class FSDP(torch.nn.Module):
             if parameter.grad is not None:
                 revive_storage(parameter.grad)
             shraded_parameter = self.saved_parameters[module_name][name]
-            dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data)
+            return dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data, async_op=True)
 
     @torch.no_grad()
     def free_module(self, module):
         for parameter in module.parameters():
-            if parameter.grad is not None:
-                free_storage(parameter.grad)
+            parameter.grad = None
             free_storage(parameter) 
     
-    def construct_pre_forward_hook(self, layer_name: int):
+    def construct_pre_forward_hook(self, layer_name: str):
         def forward_hook(module: torch.nn.Module, inputs):
-            self.all_gather_module(module, layer_name)
+            # Should happen before
+            self.sharded_handles[self.current_index + LOOKAHEAD_COUNT] = self.all_gather_module(module, layer_name)
+
+            # Should happen now
+            self.sharded_handles[self.current_index].wait()
+            self.current_index += 1
         return forward_hook
 
-    def construct_post_forward_hook(self, layer_name: int):
+    def construct_post_forward_hook(self, layer_name: str):
         def forward_hook(module: torch.nn.Module, inputs, output):
             self.free_module(module)
         return forward_hook
 
-    def construct_pre_backward_hook(self, layer_name: int):
+    def construct_pre_backward_hook(self, layer_name: str):
         def backward_hook(module: torch.nn.Module, grad_inputs):
-            self.all_gather_module(module, layer_name)
+            # Should happen before
+            self.backward_sharded_handles[self.backward_current_index - LOOKAHEAD_COUNT] = self.all_gather_module(module, layer_name)
+
+            self.backward_sharded_handles[self.backward_current_index].wait()
+
+            if self.backward_current_index == 0:
+                self.backward_current_index = 30
+                self.backward_sharded_handles = {}
+
+            self.backward_current_index -= 1
+
         return backward_hook
 
-    def construct_post_backward_hook(self, layer_name: int):
-        def backward_hook(module: torch.nn.Module, grad_inputs, grad_output):
+    def construct_post_backward_hook(self, layer_name: str, name: str):
+        def backward_hook(parameter):
             with torch.no_grad():
-                for name, parameter in module.named_parameters():
-                    if name in self.saved_parameters[layer_name]:
-                        if parameter.grad is not None:
-                            sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
-                            dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG)
-                            if sliced_gradient is not None:
-                                master_print(sliced_gradient)
+                if name in self.saved_parameters[layer_name]:
+                    if parameter.grad is not None:
+                        sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
+                        handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
+
+                        if self.saved_parameters[layer_name][name].grad is None:
                             self.saved_parameters[layer_name][name].grad = sliced_gradient
-                        self.free_module(module)
+                        else:
+                            self.saved_parameters[layer_name][name].grad += sliced_gradient
+
+                        parameter.grad = None
+                        free_storage(parameter)
+                        self.end_handles.append(handle)
         return backward_hook
 
-    def forward(self, *inputs, **kwargs) -> torch.Tensor:
-        return self.module(*inputs, **kwargs)
-    
-    def finish_gradient_synchronization(self):
-        dist.barrier()
-    
     def gather_full_params(self):
 
         for submodule_name, sub_module in self.module.named_modules():
@@ -142,6 +168,21 @@ class FSDP(torch.nn.Module):
                 self.free_module(sub_module)
         
         return new_state_dict
+
+    def send_grad(self, param):
+        with torch.no_grad():
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
+            self.end_handles.append(handle)
+    
+    def forward(self, *inputs, **kwargs) -> torch.Tensor:
+        self.current_index = 0
+        self.sharded_handles = {}
+        return self.module(*inputs, **kwargs)
+    
+    def finish_gradient_synchronization(self):
+        for handle in self.end_handles:
+            handle.wait()
+        self.end_handles.clear()
 
 class ShardedOptimizer(torch.optim.Optimizer):
 
