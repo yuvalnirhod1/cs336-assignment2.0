@@ -44,7 +44,6 @@ class FSDP(torch.nn.Module):
         self.lookahead_count = 0
         self.index_to_layer = {}
         self.max_index = 0
-        print("Starting fSDP!")
 
         self.atomic_layers = [(name, module) for name, module in module.named_modules() if len(list(module.children())) == 0]
 
@@ -96,12 +95,16 @@ class FSDP(torch.nn.Module):
         return sliced_parameters
 
     @torch.no_grad() 
-    def all_gather_module(self, module, module_name):
+    def all_gather_module(self, module, module_name, dtype=None):
         handles = []
+        if not dtype:
+            dtype = self.compute_dtype
+
         for name, parameter in module.named_parameters():
             revive_storage(parameter)
             shraded_parameter = self.saved_parameters[module_name][name]
-            handles.append(dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data.to(self.compute_dtype), async_op=True))
+            parameter.data = parameter.data.to(dtype)
+            handles.append(dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data.to(dtype), async_op=True))
         return handles
 
     @torch.no_grad()
@@ -184,18 +187,16 @@ class FSDP(torch.nn.Module):
         return backward_hook
 
     def construct_post_grad_hook(self, layer_name: str, name: str):
-        print("Constructing something")
         def backward_hook(parameter):
             with torch.no_grad():
                 sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
-                handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
+                handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1).to(torch.float32), op=dist.ReduceOp.AVG, async_op=True)
 
                 if self.saved_parameters[layer_name][name].grad is None:
                     self.saved_parameters[layer_name][name].grad = sliced_gradient
                 else:
                     self.saved_parameters[layer_name][name].grad += sliced_gradient
 
-                print("Non grad!")
                 parameter.grad = None
                 free_storage(parameter)
                 self.end_handles.append(handle)
@@ -207,11 +208,11 @@ class FSDP(torch.nn.Module):
 
         for submodule_name, sub_module in self.atomic_layers:
             if isinstance(sub_module, self.SHARD_TYPES):
-                handles.extend(self.all_gather_module(sub_module, submodule_name))
+                handles.extend(self.all_gather_module(sub_module, submodule_name, dtype=torch.float32))
         
         for handle in handles:
             handle.wait()
-            
+
         new_state_dict = copy.deepcopy(self.module.state_dict())
 
         for submodule_name, sub_module in self.atomic_layers:
