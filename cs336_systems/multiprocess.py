@@ -23,7 +23,7 @@ def master_print(*args, **kwargs):
     if dist.get_rank() == 0:
         print(*args, **kwargs)
 
-LOOKAHEAD_COUNT = 0
+LOOKAHEAD_COUNT = 2
 
 class FSDP(torch.nn.Module):
     # TODO:
@@ -34,7 +34,6 @@ class FSDP(torch.nn.Module):
     
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
         super().__init__()
-        torch.autograd.set_detect_anomaly(True, check_nan=False)
         self.compute_dtype = compute_dtype
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
@@ -46,8 +45,10 @@ class FSDP(torch.nn.Module):
         self.index_to_layer = {}
         self.max_index = 0
 
+        self.atomic_layers = [(name, module) for name, module in module.named_modules() if len(list(module.children())) == 0]
+
         saved_parameters = torch.nn.ParameterDict()
-        for name, sub_module in module.named_modules():
+        for name, sub_module in self.atomic_layers:
             if isinstance(sub_module, self.SHARD_TYPES):
                 saved_parameters[name] = self.split_module(sub_module)
 
@@ -97,10 +98,7 @@ class FSDP(torch.nn.Module):
     def all_gather_module(self, module, module_name):
         handles = []
         for name, parameter in module.named_parameters():
-            master_print(f"Gathering {module_name} {name}")
             revive_storage(parameter)
-            if parameter.grad is not None:
-                revive_storage(parameter.grad)
             shraded_parameter = self.saved_parameters[module_name][name]
             handles.append(dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data, async_op=True))
         return handles
@@ -113,10 +111,8 @@ class FSDP(torch.nn.Module):
 
     def _is_layer_sharded(self, index):
         if index >= self.max_index or index < 0:
-            master_print(f"index {index} is AOB")
             return False
         lookahead_layer, lookahead_layer_name = self.index_to_layer[index]
-        master_print(f"For index {index} got {lookahead_layer_name}")
         return lookahead_layer_name in self.saved_parameters
     
     def construct_pre_forward_hook(self, layer_name: str):
@@ -136,7 +132,6 @@ class FSDP(torch.nn.Module):
                 self.free_module(module)
 
             if self.lookahead_count == 0:
-                master_print(f"Adding {layer_name}")
                 self.index_to_layer[self.current_index] = (module, layer_name)
             else:
                 index = self.current_index + self.lookahead_count
@@ -158,12 +153,7 @@ class FSDP(torch.nn.Module):
                 self._setup_backward_pass()
                 self.backward_sharded_handles[self.backward_current_index] = self.all_gather_module(module, layer_name)
 
-            master_print(f"{self.max_index}, {self.backward_current_index}")
-            master_print(self.backward_sharded_handles.keys())
-            master_print(f"{self.backward_current_index} handling module {layer_name} {module}")
-
             for handle in self.backward_sharded_handles[self.backward_current_index]:
-                master_print(f"{self.backward_current_index} Waited!")
                 handle.wait()
             del self.backward_sharded_handles[self.backward_current_index]
 
@@ -171,25 +161,21 @@ class FSDP(torch.nn.Module):
 
     def construct_post_backward_hook(self, layer_name: str):
         def backward_hook(module: torch.nn.Module, grad_inputs, grad_outputs):
-            master_print(f" LAYER {self.backward_current_index}")
             # We need this both in pre and post hook to handle the case where the last layer is 
             # not pre-hooked. In the forward passed we managed to escape this by using forward
             if self.backward_current_index == self.BACKWARD_INDEX_RESET_VALUE:
                 self._setup_backward_pass()
-                
+
             if self.backward_current_index == self.max_index - 1 and self.lookahead_count > 0:
                 for i in range(self.lookahead_count - 1):
                     index = self.backward_current_index - i - 1
                     _, layer_name = self.index_to_layer[index]
-                    master_print(f"Adding layer {index}, {layer_name}")
                     if self._is_layer_sharded(index):
-                        master_print(self.index_to_layer[index])
                         self.backward_sharded_handles[index] = self.all_gather_module(*self.index_to_layer[index])
 
             index = self.backward_current_index - self.lookahead_count
             if self._is_layer_sharded(index):
                 _, layer_name = self.index_to_layer[index]
-                master_print(f"Adding layer {index}, {layer_name}")
                 self.backward_sharded_handles[index] = self.all_gather_module(*self.index_to_layer[index])
 
             self.backward_current_index -= 1
@@ -197,32 +183,35 @@ class FSDP(torch.nn.Module):
         return backward_hook
 
     def construct_post_grad_hook(self, layer_name: str, name: str):
+        @torch.no_grad()
         def backward_hook(parameter):
-            with torch.no_grad():
-                if name in self.saved_parameters[layer_name]:
-                    if parameter.grad is not None:
-                        sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
-                        handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
+            sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
+            handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
 
-                        if self.saved_parameters[layer_name][name].grad is None:
-                            self.saved_parameters[layer_name][name].grad = sliced_gradient
-                        else:
-                            self.saved_parameters[layer_name][name].grad += sliced_gradient
+            if self.saved_parameters[layer_name][name].grad is None:
+                self.saved_parameters[layer_name][name].grad = sliced_gradient
+            else:
+                self.saved_parameters[layer_name][name].grad += sliced_gradient
 
-                        parameter.grad = None
-                        free_storage(parameter)
-                        self.end_handles.append(handle)
+            parameter.grad = None
+            free_storage(parameter)
+            self.end_handles.append(handle)
         return backward_hook
 
     def gather_full_params(self):
 
-        for submodule_name, sub_module in self.module.named_modules():
+        handles = []
+
+        for submodule_name, sub_module in self.atomic_layers:
             if isinstance(sub_module, self.SHARD_TYPES):
-                self.all_gather_module(sub_module, submodule_name)
+                handles.extend(self.all_gather_module(sub_module, submodule_name))
+        
+        for handle in handles:
+            handle.wait()
             
         new_state_dict = copy.deepcopy(self.module.state_dict())
 
-        for submodule_name, sub_module in self.module.named_modules():
+        for submodule_name, sub_module in self.atomic_layers:
             if isinstance(sub_module, self.SHARD_TYPES):
                 self.free_module(sub_module)
         
@@ -245,9 +234,8 @@ class FSDP(torch.nn.Module):
         output = self.module(*inputs, **kwargs)
 
         if self.lookahead_count == 0:
-            master_print("Transfering lookahead count!")
             self.max_index = self.current_index
-            self.lookahead_count = 2
+            self.lookahead_count = LOOKAHEAD_COUNT
         
         return output
     
