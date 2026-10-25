@@ -24,9 +24,9 @@ class ToyFSDPModel(nn.Module):
 
     def __init__(self, vocab_size=100, d_model=64, d_ff=128):
         super().__init__()
-        from cs336_basics.transformer import Embeddings, Linear, RMSNorm
+        from cs336_basics.model import Embedding, Linear, RMSNorm
 
-        self.embedding = Embeddings(vocab_size, d_model)
+        self.embedding = Embedding(vocab_size, d_model)
         self.norm1 = RMSNorm(d_model)
         self.linear1 = Linear(d_model, d_ff)
         self.norm2 = RMSNorm(d_ff)
@@ -50,10 +50,10 @@ def _apply_mixed_precision_hooks(model, compute_dtype):
     behavior: cast Linear/Embedding weights to compute_dtype for
     forward/backward, keep master weights and optimizer updates in fp32.
     """
-    from cs336_basics.transformer import Embeddings, Linear
+    from cs336_basics.model import Embedding, Linear
 
     for mod in model.modules():
-        if not isinstance(mod, (Linear, Embeddings)):
+        if not isinstance(mod, (Linear, Embedding)):
             continue
 
         # Forward: cast weight to compute_dtype, restore fp32 after
@@ -171,7 +171,7 @@ def _test_fsdp_correctness(rank: int, world_size: int, compute_dtype):
             fsdp_full = full_params[name]
             if compute_dtype is None:
                 assert torch.allclose(np_param.data, fsdp_full, atol=1e-6, rtol=1e-4), (
-                    f"Step {step}: Parameter {name} mismatch. Max diff: {np_param.data} {fsdp_full}"
+                    f"Step {step}: Parameter {name} mismatch. Max diff: {(np_param.data - fsdp_full).abs().max().item()}"
                 )
             else:
                 assert torch.allclose(np_param.data, fsdp_full, atol=1e-4, rtol=1e-4), (
@@ -201,7 +201,7 @@ def test_fsdp_gradient_sync(compute_dtype):
 
 
 def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
-    from cs336_basics.transformer import Embeddings, Linear
+    from cs336_basics.model import Embedding, Linear
 
     torch.use_deterministic_algorithms(True)
     device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
@@ -237,7 +237,7 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
             continue
         parts = name.rsplit(".", 1)
         mod = dict(fsdp_model.module.named_modules())[parts[0]] if len(parts) == 2 else fsdp_model.module
-        if isinstance(mod, (Linear, Embeddings)):
+        if isinstance(mod, (Linear, Embedding)):
             continue
         gathered = [torch.zeros_like(param.grad) for _ in range(world_size)]
         dist.all_gather(gathered, param.grad)
