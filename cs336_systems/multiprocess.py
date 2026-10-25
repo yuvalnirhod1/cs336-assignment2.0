@@ -5,7 +5,9 @@ import torch.multiprocessing as mp
 import sys
 import timeit
 from typing import Type, Any, Dict
-from cs336_basics.model import Embedding, Linear
+
+import cs336_basics.model 
+import cs336_basics.transformer 
 import copy
 
 def alloc_storage(tensor: torch.Tensor, size: int):
@@ -29,7 +31,10 @@ class FSDP(torch.nn.Module):
     # TODO:
     # 1. Add compute_dtype usage
 
-    SHARD_TYPES = (Embedding, Linear)
+    SHARD_TYPES = (cs336_basics.model.Embedding,
+                   cs336_basics.model.Linear,
+                   cs336_basics.transformer.Embeddings,
+                   cs336_basics.transformer.Linear)
     BACKWARD_INDEX_RESET_VALUE = -1
     
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):

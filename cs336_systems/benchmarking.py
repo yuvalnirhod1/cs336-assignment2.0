@@ -88,7 +88,10 @@ def measure_training_loop(model: torch.nn.Module, iteration_count: int, vocab_si
 
         optimizer.update_lr(lr)
 
-        model.finish_gradient_synchronization()
+        try:
+            model.finish_gradient_synchronization()
+        except:
+            pass
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -105,14 +108,14 @@ OPERATION_MODES = {
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iteration_count", type=int, default=50)
+    parser.add_argument("--iteration_count", type=int, default=20)
     parser.add_argument("--vocab_size", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--context_length", type=int, default=512)
-    parser.add_argument("--d_model", type=int, default=768)
-    parser.add_argument("--num_heads", type=int, default=12)
-    parser.add_argument("--num_layers", type=int, default=12)
-    parser.add_argument("--d_ff", type=int, default=3072)
+    parser.add_argument("--d_model", type=int, default=1280)
+    parser.add_argument("--num_heads", type=int, default=20)
+    parser.add_argument("--num_layers", type=int, default=36)
+    parser.add_argument("--d_ff", type=int, default=5120)
     parser.add_argument("--memory_measure", action="store_true", default=False)
     parser.add_argument("--checkpoints", type=int, default=None)
     return parser.parse_args()
@@ -121,10 +124,6 @@ def main():
     world_size = 2
 
     args = get_args()
-
-    if args.memory_measure:
-        print("Recording memory usage")
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     start_time = timeit.default_timer()
 
@@ -139,15 +138,13 @@ def main():
 
     print(f"Total time: {end_time - start_time}")
 
-    if args.memory_measure:
-        print("Saving memory usage")
-        torch.cuda.memory._dump_snapshot("memory_usage.pickle")
-        torch.cuda.memory._record_memory_history(enabled=None)
-
-
 def distributed_training(rank, world_size, args):
     device = _setup_process_group(rank, world_size, "nccl")
     print(f"Device is {device}")
+
+    if args.memory_measure:
+        print("Recording memory usage")
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     transformer = model.TransformerLM(
         args.d_model,
@@ -160,7 +157,13 @@ def distributed_training(rank, world_size, args):
         checkpoints=args.checkpoints
     )
 
-    measure_training_loop(FSDP(transformer), args.iteration_count, args.vocab_size, args.batch_size, args.context_length, device, rank, world_size)
+    measure_training_loop(DDP(transformer), args.iteration_count, args.vocab_size, args.batch_size, args.context_length, device, rank, world_size)
+
+    if args.memory_measure:
+        print("Saving memory usage")
+        torch.cuda.memory._dump_snapshot("memory_usage.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     _cleanup_process_group()
 
 
