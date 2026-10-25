@@ -5,7 +5,7 @@ import torch.multiprocessing as mp
 import sys
 import timeit
 from typing import Type, Any, Dict
-from cs336_basics.transformer import Embeddings, Linear
+from cs336_basics.model import Embedding, Linear
 import copy
 
 def alloc_storage(tensor: torch.Tensor, size: int):
@@ -29,7 +29,7 @@ class FSDP(torch.nn.Module):
     # TODO:
     # 1. Add compute_dtype usage
 
-    SHARD_TYPES = (Embeddings, Linear)
+    SHARD_TYPES = (Embedding, Linear)
     BACKWARD_INDEX_RESET_VALUE = -1
     
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
@@ -44,6 +44,7 @@ class FSDP(torch.nn.Module):
         self.lookahead_count = 0
         self.index_to_layer = {}
         self.max_index = 0
+        print("Starting fSDP!")
 
         self.atomic_layers = [(name, module) for name, module in module.named_modules() if len(list(module.children())) == 0]
 
@@ -100,7 +101,7 @@ class FSDP(torch.nn.Module):
         for name, parameter in module.named_parameters():
             revive_storage(parameter)
             shraded_parameter = self.saved_parameters[module_name][name]
-            handles.append(dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data, async_op=True))
+            handles.append(dist.all_gather_into_tensor(parameter.data.view(-1), shraded_parameter.data.to(self.compute_dtype), async_op=True))
         return handles
 
     @torch.no_grad()
@@ -183,19 +184,21 @@ class FSDP(torch.nn.Module):
         return backward_hook
 
     def construct_post_grad_hook(self, layer_name: str, name: str):
-        @torch.no_grad()
+        print("Constructing something")
         def backward_hook(parameter):
-            sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
-            handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
+            with torch.no_grad():
+                sliced_gradient = torch.empty_like(self.saved_parameters[layer_name][name])
+                handle = dist.reduce_scatter_tensor(sliced_gradient, parameter.grad.view(-1), op=dist.ReduceOp.AVG, async_op=True)
 
-            if self.saved_parameters[layer_name][name].grad is None:
-                self.saved_parameters[layer_name][name].grad = sliced_gradient
-            else:
-                self.saved_parameters[layer_name][name].grad += sliced_gradient
+                if self.saved_parameters[layer_name][name].grad is None:
+                    self.saved_parameters[layer_name][name].grad = sliced_gradient
+                else:
+                    self.saved_parameters[layer_name][name].grad += sliced_gradient
 
-            parameter.grad = None
-            free_storage(parameter)
-            self.end_handles.append(handle)
+                print("Non grad!")
+                parameter.grad = None
+                free_storage(parameter)
+                self.end_handles.append(handle)
         return backward_hook
 
     def gather_full_params(self):
